@@ -1,0 +1,200 @@
+# ============================================================
+# gfx_banner.py — DealFound Banner Generator
+# ============================================================
+
+import io, os
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ============================================================
+# FONT PATHS
+# ============================================================
+FONT_B = [
+    os.path.join(WORK_DIR, "fonts", "DejaVuSans-Bold.ttf"),
+    "/app/fonts/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
+]
+FONT_R = [
+    os.path.join(WORK_DIR, "fonts", "DejaVuSans.ttf"),
+    "/app/fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/system/fonts/Roboto-Regular.ttf",
+]
+
+# ============================================================
+# HELPERS
+# ============================================================
+def _font(size, bold=True):
+    for p in (FONT_B if bold else FONT_R):
+        try:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+def _tb(d, t, f):
+    try:
+        b = d.textbbox((0, 0), t, font=f)
+        return b[2] - b[0], b[3] - b[1]
+    except Exception:
+        return 0, 0
+
+def _cx(d, t, f, cx, y, fill):
+    if not f:
+        return
+    try:
+        w, _ = _tb(d, t, f)
+        d.text((cx - w / 2, y), t, font=f, fill=fill)
+    except Exception:
+        pass
+
+def _pill(d, box, r, fill=None, outline=None, w=0, width=0):
+    try:
+        d.rounded_rectangle(box, radius=r, fill=fill,
+                            outline=outline, width=width or w)
+    except Exception:
+        pass
+
+# ============================================================
+# MAIN BANNER FUNCTION
+# ============================================================
+def make_banner(username, display_name, reports, victims, total,
+                profile_bytes=None, status="SCAMMER",
+                rating=0.0, rating_count=0, trusted=False):
+    """Generate DealFound scam check banner. Returns io.BytesIO or None."""
+    try:
+        W, H = 1280, 720
+
+        # ============ COLORS ============
+        BG = (18, 18, 18, 255)
+        CARD = (35, 35, 35, 255)
+        WH = (250, 250, 250, 255)
+        GR = (160, 160, 160, 255)
+
+        if trusted:
+            AC = (65, 200, 120)
+            BB = (250, 250, 250, 255)
+            BT = (20, 20, 20, 255)
+            LB = "TRUSTED"
+        elif status == "SCAMMER":
+            AC = (235, 60, 60)
+            BB = (40, 20, 20, 255)
+            BT = (255, 140, 140)
+            LB = "SCAMMER"
+        else:
+            AC = (180, 180, 180)
+            BB = (250, 250, 250, 255)
+            BT = (20, 20, 20, 255)
+            LB = "NON-SCAMMER"
+
+        img = Image.new("RGBA", (W, H), BG)
+        d = ImageDraw.Draw(img, "RGBA")
+
+        # ============ AVATAR ============
+        pcx, pcy, pr = 235, 280, 150
+
+        # Outer ring
+        d.ellipse(
+            [pcx - pr - 4, pcy - pr - 4, pcx + pr + 4, pcy + pr + 4],
+            outline=(240, 240, 240, 255), width=4
+        )
+
+        av = pr * 2
+        avi = Image.new("RGBA", (av, av), (0, 0, 0, 0))
+        pd = False
+
+        if profile_bytes:
+            try:
+                p = Image.open(io.BytesIO(profile_bytes)).convert("RGBA")
+                p = ImageOps.fit(p, (av, av), Image.LANCZOS)
+                m = Image.new("L", (av, av), 0)
+                ImageDraw.Draw(m).ellipse([0, 0, av - 1, av - 1], fill=255)
+                avi.paste(p, (0, 0), m)
+                pd = True
+            except Exception:
+                pd = False
+
+        if not pd:
+            ad = ImageDraw.Draw(avi, "RGBA")
+            ad.ellipse([0, 0, av, av], fill=(60, 60, 60, 255))
+            ad.ellipse([pr - 55, pr - 90, pr + 55, pr + 20],
+                       fill=(90, 90, 90, 255))
+
+        img.alpha_composite(avi, (pcx - pr, pcy - pr))
+        d = ImageDraw.Draw(img, "RGBA")
+
+        # ============ USERNAME ============
+        ux = 460
+        d.text((ux, 75), "USERNAME", font=_font(20, True), fill=GR)
+        cun = str(username or "").lstrip("@")[:24]
+        d.text((ux, 118), "@" + cun, font=_font(38, True), fill=WH)
+
+        # ============ DISPLAY NAME ============
+        d.text((ux, 185), "DISPLAY NAME", font=_font(20, True), fill=GR)
+        dn = str(display_name or username or "?")[:30]
+        d.text((ux, 222), dn, font=_font(28, True), fill=WH)
+
+        # ============ STATUS BADGE ============
+        bf = _font(22, True)
+        tw, _ = _tb(d, LB, bf)
+        bx2 = W - 70
+        bx1 = bx2 - tw - 90
+        _pill(d, [bx1, 75, bx2, 135], 30, fill=BB)
+        d.text((bx1 + 45, 90), LB, font=bf, fill=BT)
+
+        # ============ STAT CARDS ============
+        cy1, cy2 = 440, 620
+        cw = 310
+        gp = 30
+        sx = 80
+
+        st = [
+            ("Reports", str(reports)),
+            ("Victims", str(victims)),
+            ("Total Scammed", f"${int(total)}"),
+        ]
+        lf = _font(24, False)
+        vf = _font(60, True)
+
+        for i, (l, v) in enumerate(st):
+            x1 = sx + i * (cw + gp)
+            x2 = x1 + cw
+            cx = (x1 + x2) // 2
+
+            # Card
+            _pill(d, [x1, cy1, x2, cy2], 22, fill=CARD)
+
+            # Label
+            _cx(d, l, lf, cx, cy1 + 25, GR)
+
+            # Value box
+            _pill(d, [x1 + 35, cy2 - 85, x2 - 35, cy2 - 20],
+                  16, fill=(25, 25, 25, 255))
+            _cx(d, v, vf, cx, cy2 - 80, WH)
+
+        # ============ FOOTER ============
+        ft = "Powered by @DealFound"
+        ff = _font(16, True)
+        tw2, _ = _tb(d, ft, ff)
+        fx = W // 2 - tw2 // 2
+        fy = H - 45
+        d.text((fx, fy), ft, font=ff, fill=(220, 220, 220, 255))
+
+        # ============ SAVE ============
+        out = io.BytesIO()
+        img.convert("RGB").save(out, "PNG", optimize=True)
+        out.seek(0)
+        return out
+
+    except Exception as e:
+        print(f"[GFX] Error: {e}")
+        return None
