@@ -1,5 +1,5 @@
 # ============================================================
-# dealfound_bot.py — v14 (tg://user first, openmessage fallback)
+# bot.py — v16 (GFX in separate module)
 # ============================================================
 
 import sys, os, re, io, asyncio, logging, sqlite3, html, traceback, collections, importlib.util
@@ -13,6 +13,9 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters,
 )
 
+# ============================================================
+# PILLOW + TELETHON
+# ============================================================
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps
     PILLOW_OK = True
@@ -26,6 +29,17 @@ try:
 except ImportError:
     TELETHON_OK = False
     TelegramClient = None
+
+# ============================================================
+# IMPORT GFX MODULE (separate file)
+# ============================================================
+try:
+    from gfx_banner import make_banner as gfx_make_banner
+    GFX_MODULE_OK = True
+except Exception as _e:
+    print(f"[GFX] Module import failed: {_e}")
+    GFX_MODULE_OK = False
+    gfx_make_banner = None
 
 # ============================================================
 # CONFIG
@@ -45,6 +59,8 @@ SESSION_PATH = os.path.join(WORK_DIR, SESSION_NAME)
 DB_PATH = os.path.join(WORK_DIR, "dealfound_reports.db")
 CUSTOM_GFX_FILE = os.path.join(WORK_DIR, "custom_gfx.py")
 CUSTOM_FIX_FILE = os.path.join(WORK_DIR, "custom_fix.py")
+PROOFS_DIR = os.path.join(WORK_DIR, "proofs")
+os.makedirs(PROOFS_DIR, exist_ok=True)
 
 _BOT_REF = None
 
@@ -130,7 +146,10 @@ def init_db():
         scammer_username TEXT NOT NULL, scammer_user_id INTEGER DEFAULT 0,
         amount TEXT DEFAULT '', description TEXT DEFAULT '',
         proof_link TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
-        created_at TEXT NOT NULL, reviewed_at TEXT)""")
+        created_at TEXT NOT NULL, reviewed_at TEXT,
+        proof_archive_path TEXT DEFAULT '',
+        proof_text TEXT DEFAULT '',
+        impersonating TEXT DEFAULT '')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS appeals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, report_id INTEGER NOT NULL DEFAULT 0,
         post_link TEXT, appellant_id INTEGER NOT NULL, appellant_username TEXT,
@@ -169,6 +188,12 @@ def init_db():
         target_id INTEGER NOT NULL, reviewer_id INTEGER NOT NULL,
         rating INTEGER NOT NULL, comment TEXT DEFAULT '',
         created_at TEXT NOT NULL)""")
+    con.commit()
+    for col in ["proof_archive_path TEXT DEFAULT ''",
+                "proof_text TEXT DEFAULT ''",
+                "impersonating TEXT DEFAULT ''"]:
+        try: cur.execute(f"ALTER TABLE reports ADD COLUMN {col}")
+        except Exception: pass
     con.commit(); con.close()
 
 def cache_get(u):
@@ -215,7 +240,8 @@ def create_report(rid, run, su, sid, amt, desc, proof):
 def get_report(rid):
     con = db(); cur = con.cursor()
     cur.execute("""SELECT id, reporter_id, reporter_username, scammer_username,
-        scammer_user_id, amount, description, proof_link, status, created_at, reviewed_at
+        scammer_user_id, amount, description, proof_link, status, created_at, reviewed_at,
+        proof_archive_path, proof_text, impersonating
         FROM reports WHERE id=?""", (rid,))
     r = cur.fetchone(); con.close()
     return r
@@ -229,6 +255,17 @@ def set_report_status(rid, s):
 def set_scammer_id(rid, uid):
     con = db(); cur = con.cursor()
     cur.execute("UPDATE reports SET scammer_user_id=? WHERE id=?", (uid, rid))
+    con.commit(); con.close()
+
+def set_impersonation(rid, imp):
+    con = db(); cur = con.cursor()
+    cur.execute("UPDATE reports SET impersonating=? WHERE id=?", (imp, rid))
+    con.commit(); con.close()
+
+def save_proof_archive(rid, path, text):
+    con = db(); cur = con.cursor()
+    cur.execute("UPDATE reports SET proof_archive_path=?, proof_text=? WHERE id=?",
+                (path, text, rid))
     con.commit(); con.close()
 
 def get_scammer_stats(u):
@@ -415,15 +452,12 @@ async def get_resolver():
     if not TELETHON_OK: return None
     if _resolver_client is not None: return _resolver_client
     sess = _session_exists()
-    if not sess:
-        log.warning("[Resolver] No session file found!")
-        return None
+    if not sess: return None
     base = sess[:-8] if sess.endswith(".session") else sess
     try:
         _resolver_client = TelegramClient(base, API_ID, API_HASH)
         await _resolver_client.connect()
         if not await _resolver_client.is_user_authorized():
-            log.warning("[Resolver] Not authorized!")
             _resolver_client = None; return None
         me = await _resolver_client.get_me()
         log.info(f"[Resolver] OK @{getattr(me,'username','?')} (id={me.id})")
@@ -436,9 +470,7 @@ async def resolve_username(username, max_retries=5):
     clean = (username or "").lstrip("@").strip()
     if not clean: return 0
     cached = cache_get(clean)
-    if cached:
-        log.info(f"[Resolver] CACHE @{clean} -> {cached}")
-        return cached
+    if cached: return cached
     global _resolver_client
     for attempt in range(1, max_retries + 1):
         try:
@@ -447,9 +479,7 @@ async def resolve_username(username, max_retries=5):
                 entity = await client.get_entity(f"@{clean}")
                 uid = int(entity.id)
                 if uid > 0:
-                    log.info(f"[Resolver] OK @{clean} -> {uid} (try {attempt})")
-                    cache_set(clean, uid)
-                    return uid
+                    cache_set(clean, uid); return uid
         except Exception as e:
             err = str(e)
             log.warning(f"[Resolver] try {attempt}: {err[:120]}")
@@ -457,7 +487,6 @@ async def resolve_username(username, max_retries=5):
                 m = re.search(r"(\d+)", err)
                 if m: await asyncio.sleep(min(int(m.group(1)) + 1, 15)); continue
         await asyncio.sleep(0.3)
-    log.error(f"[Resolver] FAIL @{clean}")
     return 0
 
 async def get_display_name(username):
@@ -493,6 +522,59 @@ async def shutdown_resolver():
         try: await _resolver_client.disconnect()
         except Exception: pass
         _resolver_client = None
+
+# ============================================================
+# PROOF ARCHIVING
+# ============================================================
+async def archive_proof(proof_link, report_id):
+    result = {"path": "", "text": "", "media_type": "", "success": False}
+    try:
+        m = re.search(r"t\.me/([^/]+)/(\d+)", proof_link)
+        if not m: return result
+        channel = m.group(1)
+        msg_id = int(m.group(2))
+        client = await get_resolver()
+        if client is None: return result
+
+        if channel == "c":
+            m2 = re.search(r"t\.me/c/(\d+)/(\d+)", proof_link)
+            if not m2: return result
+            peer = int(f"-100{m2.group(1)}")
+            msg_id = int(m2.group(2))
+        else:
+            peer = channel
+
+        try:
+            msg = await client.get_messages(peer, ids=msg_id)
+        except Exception as e:
+            log.error(f"[Proof] get_messages: {e}"); return result
+        if msg is None: return result
+
+        if msg.text: result["text"] = msg.text[:3000]
+        elif msg.caption: result["text"] = msg.caption[:3000]
+
+        if msg.media:
+            report_dir = os.path.join(PROOFS_DIR, str(report_id))
+            os.makedirs(report_dir, exist_ok=True)
+            try:
+                file_path = await client.download_media(msg, file=report_dir + "/")
+                if file_path:
+                    rel = os.path.relpath(file_path, PROOFS_DIR)
+                    result["path"] = rel
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in (".jpg",".jpeg",".png",".webp"): result["media_type"] = "image"
+                    elif ext in (".mp4",".mov",".mkv"): result["media_type"] = "video"
+                    elif ext == ".pdf": result["media_type"] = "pdf"
+                    else: result["media_type"] = "file"
+            except Exception as e:
+                log.error(f"[Proof] download: {e}")
+
+        result["success"] = True
+        log.info(f"[Proof] Archived #{report_id}: path={result['path']}")
+        return result
+    except Exception as e:
+        log.exception(f"[Proof] {e}")
+        return result
 
 # ============================================================
 # SAFE SEND
@@ -572,20 +654,30 @@ async def check_member(bot, uid):
     except Exception: return False
 
 # ============================================================
-# BANNER HELPERS
+# BANNER HELPERS (used by custom_gfx injection)
 # ============================================================
-FONT_B = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-          "/system/fonts/Roboto-Bold.ttf"]
-FONT_R = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-          "/system/fonts/Roboto-Regular.ttf"]
+FONT_B = [
+    os.path.join(WORK_DIR, "fonts", "DejaVuSans-Bold.ttf"),
+    "/app/fonts/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
+]
+FONT_R = [
+    os.path.join(WORK_DIR, "fonts", "DejaVuSans.ttf"),
+    "/app/fonts/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/system/fonts/Roboto-Regular.ttf",
+]
 
 def _font(size, bold=True):
     for p in (FONT_B if bold else FONT_R):
         try:
             if os.path.exists(p): return ImageFont.truetype(p, size)
         except Exception: pass
-    try: return ImageFont.load_default()
-    except Exception: return None
+    try: return ImageFont.load_default(size=size)
+    except Exception:
+        try: return ImageFont.load_default()
+        except Exception: return None
 
 def _tb(d, t, f):
     try:
@@ -604,105 +696,21 @@ def _pill(d, box, r, fill=None, outline=None, w=0, width=0):
     except Exception: pass
 
 # ============================================================
-# DEFAULT BANNER
+# MAKE_BANNER WRAPPER — calls gfx_banner.py
 # ============================================================
 def make_banner(username, display_name, reports, victims, total,
                 profile_bytes=None, status="SCAMMER",
                 rating=0.0, rating_count=0, trusted=False):
-    if not PILLOW_OK: return None
+    """Wrapper — delegates to gfx_banner.py"""
+    if not GFX_MODULE_OK or gfx_make_banner is None:
+        log.warning("[GFX] Module not available")
+        return None
     try:
-        W, H = 1100, 560
-        BG = (10, 10, 12, 255); CARD = (20, 20, 24, 255); BORDER = (40, 40, 46, 255)
-        WHITE = (240, 240, 245, 255); GREY = (130, 130, 140, 255); DIVIDER = (35, 35, 42, 255)
-        if trusted:
-            ACCENT = (52, 211, 118); BADGE_BG = (18, 55, 34); BADGE_TXT = (130, 240, 170)
-        elif status == "SCAMMER":
-            ACCENT = (235, 60, 70); BADGE_BG = (65, 18, 24); BADGE_TXT = (250, 130, 140)
-        else:
-            ACCENT = (80, 130, 230); BADGE_BG = (22, 38, 70); BADGE_TXT = (150, 180, 245)
-
-        img = Image.new("RGBA", (W, H), BG)
-        d = ImageDraw.Draw(img, "RGBA")
-        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glow, "RGBA")
-        for r in range(600, 0, -8):
-            a = int(20 * (1 - r / 600) ** 2)
-            gd.ellipse([W // 2 - r, -r * 2, W // 2 + r, r // 3], fill=(*ACCENT, a))
-        img = Image.alpha_composite(img, glow)
-        d = ImageDraw.Draw(img, "RGBA")
-        _pill(d, [15, 15, W - 15, H - 15], 22, fill=None, outline=BORDER, width=2)
-
-        pcx, pcy, pr = 110, 145, 62
-        d.ellipse([pcx - pr - 5, pcy - pr - 5, pcx + pr + 5, pcy + pr + 5], outline=ACCENT, width=3)
-        av = pr * 2
-        avi = Image.new("RGBA", (av, av), (0, 0, 0, 0))
-        pasted = False
-        if profile_bytes:
-            try:
-                p = Image.open(io.BytesIO(profile_bytes)).convert("RGBA")
-                p = ImageOps.fit(p, (av, av), Image.LANCZOS)
-                mask = Image.new("L", (av, av), 0)
-                ImageDraw.Draw(mask).ellipse([0, 0, av - 1, av - 1], fill=255)
-                avi.paste(p, (0, 0), mask); pasted = True
-            except Exception: pasted = False
-        if not pasted:
-            ad = ImageDraw.Draw(avi, "RGBA")
-            ad.ellipse([0, 0, av, av], fill=(35, 35, 40, 255))
-            ad.ellipse([pr - 24, pr - 40, pr + 24, pr + 8], fill=(70, 70, 78, 255))
-            ad.ellipse([pr - 45, pr + 15, pr + 45, pr + 90], fill=(70, 70, 78, 255))
-        img.alpha_composite(avi, (pcx - pr, pcy - pr))
-        d = ImageDraw.Draw(img, "RGBA")
-
-        ux = 210
-        d.text((ux, 85), "USERNAME", font=_font(12, True), fill=GREY)
-        cun = str(username or "").lstrip("@")[:20]
-        d.text((ux, 102), "@" + cun, font=_font(28, True), fill=WHITE)
-        d.text((ux, 148), "DISPLAY NAME", font=_font(12, True), fill=GREY)
-        dn = str(display_name or username or "?")[:26]
-        d.text((ux, 165), dn, font=_font(20, True), fill=WHITE)
-
-        label = ("TRUSTED" if trusted else "SCAMMER" if status == "SCAMMER" else "NOT FLAGGED")
-        bf = _font(14, True)
-        tw, th = _tb(d, label, bf)
-        bx2 = W - 40; bx1 = bx2 - tw - 40; by1 = 75; by2 = 108
-        _pill(d, [bx1, by1, bx2, by2], 16, fill=BADGE_BG, outline=ACCENT, width=2)
-        d.text((bx1 + 20, by1 + 8), label, font=bf, fill=BADGE_TXT)
-
-        if rating_count > 0:
-            rt = f"★ {rating:.1f}/5   {rating_count} reviews"
-            rw, _ = _tb(d, rt, _font(13, False))
-            d.text((bx2 - rw, 122), rt, font=_font(13, False), fill=(245, 200, 80, 255))
-
-        d.line([(60, 235), (W - 60, 235)], fill=DIVIDER, width=1)
-
-        cy1, cy2 = 275, 455
-        card_w = 300; gap = 25
-        sx0 = (W - (card_w * 3 + gap * 2)) // 2
-        stats = [("Reports", str(reports)), ("Victims", str(victims)), ("Total Scammed", f"${int(total)}")]
-        label_font = _font(13, True); value_font = _font(42, True)
-        for i, (lb, val) in enumerate(stats):
-            x1 = sx0 + i * (card_w + gap); x2 = x1 + card_w
-            cx = (x1 + x2) // 2
-            _pill(d, [x1, cy1, x2, cy2], 14, fill=CARD, outline=BORDER, width=2)
-            d.line([(x1 + 30, cy1 + 2), (x2 - 30, cy1 + 2)], fill=ACCENT, width=3)
-            _cx(d, lb, label_font, cx, cy1 + 25, GREY)
-            vx1 = x1 + 30; vx2 = x2 - 30; vy1 = cy2 - 85; vy2 = cy2 - 25
-            _pill(d, [vx1, vy1, vx2, vy2], 10, fill=(10, 10, 12, 255), outline=(*ACCENT, 90), width=1)
-            _cx(d, val, value_font, cx, vy1 + 10, WHITE)
-
-        ft = "Powered by DealFound"
-        ff = _font(13, True)
-        tw, _ = _tb(d, ft, ff)
-        shield_cx = W // 2 - tw // 2 - 16; shield_cy = H - 45
-        d.ellipse([shield_cx - 9, shield_cy - 9, shield_cx + 9, shield_cy + 9], outline=ACCENT, width=1)
-        d.text((shield_cx - 4, shield_cy - 7), "D", font=_font(11, True), fill=ACCENT)
-        d.text((W // 2 - tw // 2 + 6, H - 53), ft, font=ff, fill=GREY)
-
-        out = io.BytesIO()
-        img.convert("RGB").save(out, "PNG", optimize=True)
-        out.seek(0); return out
+        return gfx_make_banner(username, display_name, reports, victims,
+                               total, profile_bytes, status, rating,
+                               rating_count, trusted)
     except Exception as e:
-        log.exception(f"[Banner] {e}")
+        log.exception(f"[GFX] Banner failed: {e}")
         return None
 
 # ============================================================
@@ -714,8 +722,7 @@ _custom_gfx_mtime = 0
 def load_custom_gfx():
     global _custom_gfx_func, _custom_gfx_mtime
     if not os.path.exists(CUSTOM_GFX_FILE):
-        _custom_gfx_func = None
-        return None
+        _custom_gfx_func = None; return None
     try:
         mtime = os.path.getmtime(CUSTOM_GFX_FILE)
         if _custom_gfx_func is not None and mtime == _custom_gfx_mtime:
@@ -731,13 +738,10 @@ def load_custom_gfx():
         if hasattr(mod, "make_banner"):
             _custom_gfx_func = mod.make_banner
             _custom_gfx_mtime = mtime
-            log.info(f"[GFX] Custom loaded")
-            return _custom_gfx_func
-        _custom_gfx_func = None
-        return None
+            log.info(f"[GFX] Custom loaded"); return _custom_gfx_func
+        _custom_gfx_func = None; return None
     except Exception as e:
-        log.exception(f"[GFX] Load failed: {e}")
-        return None
+        log.exception(f"[GFX] {e}"); return None
 
 def get_banner_func():
     f = load_custom_gfx()
@@ -748,29 +752,21 @@ def reload_gfx():
     _custom_gfx_func = None; _custom_gfx_mtime = 0
     return load_custom_gfx()
 
-# ============================================================
-# CUSTOM FIX LOADER
-# ============================================================
 _custom_fix_loaded = False
 _custom_fix_mtime = 0
 
 def load_custom_fix():
     global _custom_fix_loaded, _custom_fix_mtime
-    if not os.path.exists(CUSTOM_FIX_FILE):
-        return False
+    if not os.path.exists(CUSTOM_FIX_FILE): return False
     try:
         mtime = os.path.getmtime(CUSTOM_FIX_FILE)
-        if _custom_fix_loaded and mtime == _custom_fix_mtime:
-            return True
-        with open(CUSTOM_FIX_FILE, "r", encoding="utf-8") as f:
-            code = f.read()
+        if _custom_fix_loaded and mtime == _custom_fix_mtime: return True
+        with open(CUSTOM_FIX_FILE, "r", encoding="utf-8") as f: code = f.read()
         exec(compile(code, str(CUSTOM_FIX_FILE), "exec"), globals())
         _custom_fix_loaded = True; _custom_fix_mtime = mtime
-        log.info(f"[Fix] Custom fix loaded")
-        return True
+        log.info(f"[Fix] Loaded"); return True
     except Exception as e:
-        log.exception(f"[Fix] Load failed: {e}")
-        return False
+        log.exception(f"[Fix] {e}"); return False
 
 def reload_fix():
     global _custom_fix_loaded, _custom_fix_mtime
@@ -891,7 +887,7 @@ async def cb_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # REPORT FLOW
 # ============================================================
-DF_T, DF_A, DF_D, DF_P = range(1, 5)
+DF_T, DF_A, DF_D, DF_P, DF_IMP = range(1, 6)
 
 async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -908,7 +904,7 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try: context.user_data.clear()
     except Exception: pass
-    await safe_edit(q, f"{ce('user')} <b>Step 1/4 — Enter target username or user ID:</b>",
+    await safe_edit(q, f"{ce('user')} <b>Step 1/5 — Enter target username or user ID:</b>",
                     parse_mode="HTML")
     return DF_T
 
@@ -921,7 +917,7 @@ async def r_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if raw.isdigit() and int(raw) > 0:
         context.user_data["s_un"] = f"id{raw}"; context.user_data["s_id"] = int(raw)
         await safe_reply(msg, f"{ce('check')} <b>Target:</b> <code>{raw}</code>\n\n"
-                              f"{ce('money')} <b>Step 2/4 — Amount:</b>", parse_mode="HTML")
+                              f"{ce('money')} <b>Step 2/5 — Amount:</b>", parse_mode="HTML")
         return DF_A
     clean = normalize_username(raw)
     if not clean:
@@ -933,11 +929,11 @@ async def r_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if detected_id:
         await safe_reply(msg, f"{ce('check')} <b>@{html.escape(clean)}</b>\n"
                               f"🆔 <code>{detected_id}</code>\n\n"
-                              f"{ce('money')} <b>Step 2/4 — Amount:</b>", parse_mode="HTML")
+                              f"{ce('money')} <b>Step 2/5 — Amount:</b>", parse_mode="HTML")
     else:
         await safe_reply(msg, f"{ce('warning')} <b>@{html.escape(clean)}</b>\n"
                               f"🆔 <i>Could not resolve</i>\n\n"
-                              f"{ce('money')} <b>Step 2/4 — Amount:</b>", parse_mode="HTML")
+                              f"{ce('money')} <b>Step 2/5 — Amount:</b>", parse_mode="HTML")
     return DF_A
 
 async def r_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -950,7 +946,7 @@ async def r_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(msg, f"{ce('cross')} <b>Invalid amount.</b>", parse_mode="HTML")
         return DF_A
     context.user_data["amt"] = amt
-    await safe_reply(msg, f"{ce('list')} <b>Step 3/4 — Explain the scam:</b>", parse_mode="HTML")
+    await safe_reply(msg, f"{ce('list')} <b>Step 3/5 — Explain the scam:</b>", parse_mode="HTML")
     return DF_D
 
 async def r_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -963,7 +959,7 @@ async def r_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(msg, f"{ce('cross')} <b>3-3000 chars.</b>", parse_mode="HTML")
         return DF_D
     context.user_data["desc"] = d
-    await safe_reply(msg, f"{ce('pin')} <b>Step 4/4 — Proof link:</b>", parse_mode="HTML")
+    await safe_reply(msg, f"{ce('pin')} <b>Step 4/5 — Proof link:</b>", parse_mode="HTML")
     return DF_P
 
 async def r_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -975,15 +971,52 @@ async def r_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (proof.startswith("https://t.me/") or proof.startswith("http://t.me/")):
         await safe_reply(msg, f"{ce('cross')} <b>Invalid link.</b>", parse_mode="HTML")
         return DF_P
+    context.user_data["proof"] = proof
+    await safe_reply(msg,
+        f"{ce('info')} <b>Step 5/5 — Optional</b>\n\n"
+        f"<b>Kis user ko impersonate kar raha hai?</b>\n\n"
+        f"<b>Username do</b> (<code>@original</code>) <b>ya</b> <code>skip</code> <b>type karo.</b>",
+        parse_mode="HTML")
+    return DF_IMP
+
+async def r_impersonate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text: return DF_IMP
+    imp = msg.text.strip().lower()
+    imp_val = ""
+    if imp in ("skip", "none", "-"):
+        imp_val = ""
+    else:
+        clean = normalize_username(imp)
+        if not clean:
+            await safe_reply(msg, f"{ce('cross')} <b>Invalid username or type</b> <code>skip</code>",
+                             parse_mode="HTML")
+            return DF_IMP
+        imp_val = "@" + clean
+
     u = update.effective_user
     su = context.user_data["s_un"]; sid = context.user_data.get("s_id", 0)
     amt = context.user_data.get("amt", ""); d = context.user_data.get("desc", "")
+    proof = context.user_data.get("proof", "")
     rid = create_report(u.id if u else 0, u.username if u else None, su, sid, amt, d, proof)
+    if imp_val: set_impersonation(rid, imp_val)
+
+    arch_msg = await safe_reply(msg, f"{ce('time')} <b>Archiving proof…</b>", parse_mode="HTML")
+    try:
+        arch = await archive_proof(proof, rid)
+        if arch["success"]:
+            save_proof_archive(rid, arch["path"], arch["text"])
+    except Exception as e:
+        log.error(f"[Proof] {e}")
+    try: await arch_msg.delete()
+    except Exception: pass
+
     rname = f"@{u.username}" if u and u.username else "No username"
+    imp_line = f"\n🎭 <b>Impersonating:</b> <b>{html.escape(imp_val)}</b>" if imp_val else ""
     admin_text = (f"{ce('warning')} <b>NEW REPORT #{rid}</b>\n\n"
                   f"{ce('user')} <b>Reporter:</b> <b>{html.escape(rname)}</b> (<code>{u.id if u else 0}</code>)\n\n"
                   f"{ce('fire')} <b>Target:</b> <b>{html.escape(su)}</b>\n"
-                  f"🆔 <code>{sid or 'NOT SET'}</code>\n\n"
+                  f"🆔 <code>{sid or 'NOT SET'}</code>{imp_line}\n\n"
                   f"{ce('money')} <b>Amount:</b> <b>{html.escape(amt)}</b>\n\n"
                   f"📝 <b>{html.escape(d)}</b>\n\n"
                   f"🔗 {html.escape(proof)}")
@@ -996,7 +1029,7 @@ async def r_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await safe_send(context.bot, aid, admin_text, parse_mode="HTML",
                              reply_markup=InlineKeyboardMarkup(rows), disable_web_page_preview=True)
         except Exception: pass
-    await safe_reply(msg, f"{ce('check')} <b>Report submitted.</b>",
+    await safe_reply(msg, f"{ce('check')} <b>Report submitted.</b>\n\n<i>Proof archived.</i>",
                      parse_mode="HTML", reply_markup=main_kb())
     try: context.user_data.clear()
     except Exception: pass
@@ -1120,8 +1153,7 @@ async def cb_ap_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def cb_rc_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS:
-        await safe_answer(q, "No.", alert=True); return
+    if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     try: rid = int(q.data.split(":", 1)[1])
     except Exception: return
@@ -1135,8 +1167,7 @@ async def cb_rc_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_rc_hist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS:
-        await safe_answer(q, "No.", alert=True); return
+    if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     try: rid = int(q.data.split(":", 1)[1])
     except Exception: return
@@ -1211,8 +1242,7 @@ async def recv_reporter_chat(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================================================
 async def cb_ac_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS:
-        await safe_answer(q, "No.", alert=True); return
+    if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     try: aid = int(q.data.split(":", 1)[1])
     except Exception: return
@@ -1226,8 +1256,7 @@ async def cb_ac_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_ac_hist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS:
-        await safe_answer(q, "No.", alert=True); return
+    if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     try: aid = int(q.data.split(":", 1)[1])
     except Exception: return
@@ -1339,9 +1368,8 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bo = func(clean, dn, reports, victims, total, pb, status,
                      rating=rating, rating_count=rating_count, trusted=trusted)
         except Exception as e:
-            log.error(f"[GFX] Custom failed, fallback: {e}")
-            bo = make_banner(clean, dn, reports, victims, total, pb, status,
-                            rating=rating, rating_count=rating_count, trusted=trusted)
+            log.error(f"[GFX] {e}")
+            bo = None
     if thinking:
         try: await thinking.delete()
         except Exception: pass
@@ -1369,8 +1397,7 @@ async def cmd_addgfxcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     context.user_data["await_gfx_code"] = True
     await update.message.reply_text(
-        f"{ce('info')} <b>Add Custom GFX Code</b>\n\n"
-        f"Send Python code with <code>def make_banner(...)</code>\n\n/cancel to abort.",
+        f"{ce('info')} <b>Send Python code with def make_banner.</b>\n\n/cancel to abort.",
         parse_mode="HTML")
 
 async def recv_gfx_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1383,42 +1410,38 @@ async def recv_gfx_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = re.sub(r"^```(?:python)?\s*\n?", "", code)
     code = re.sub(r"\n?```\s*$", "", code)
     if "def make_banner" not in code:
-        await msg.reply_text(f"{ce('cross')} <b>Code must have def make_banner.</b>", parse_mode="HTML")
+        await msg.reply_text(f"{ce('cross')} <b>Missing def make_banner.</b>", parse_mode="HTML")
         return
     try: compile(code, "<custom_gfx>", "exec")
     except SyntaxError as e:
-        await msg.reply_text(f"{ce('cross')} <b>Syntax error:</b>\n<code>{html.escape(str(e))}</code>",
-                             parse_mode="HTML")
+        await msg.reply_text(f"{ce('cross')} <b>Syntax:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
         return
     try:
         with open(CUSTOM_GFX_FILE, "w", encoding="utf-8") as f: f.write(code)
     except Exception as e:
-        await msg.reply_text(f"{ce('cross')} <b>Save failed:</b> <code>{html.escape(str(e))}</code>",
-                             parse_mode="HTML")
+        await msg.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
         return
     func = reload_gfx()
     context.user_data.pop("await_gfx_code", None)
     if func is None:
-        await msg.reply_text(f"{ce('warning')} <b>Saved but failed to load.</b>", parse_mode="HTML")
+        await msg.reply_text(f"{ce('warning')} <b>Saved but load failed.</b>", parse_mode="HTML")
         return
-    await msg.reply_text(
-        f"{ce('check')} <b>Custom GFX saved!</b>\n\nTest: <code>/testgfx @username</code>",
-        parse_mode="HTML")
+    await msg.reply_text(f"{ce('check')} <b>Custom GFX saved!</b>\n\nTest: <code>/testgfx @username</code>",
+                         parse_mode="HTML")
 
 async def cmd_removegfxcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     try:
         if os.path.exists(CUSTOM_GFX_FILE): os.remove(CUSTOM_GFX_FILE)
         reload_gfx()
-        await update.message.reply_text(f"{ce('check')} <b>Custom GFX removed.</b>", parse_mode="HTML")
+        await update.message.reply_text(f"{ce('check')} <b>Removed.</b>", parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
 async def cmd_showgfxcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     if not os.path.exists(CUSTOM_GFX_FILE):
-        await update.message.reply_text(f"{ce('info')} <b>No custom GFX.</b>", parse_mode="HTML")
-        return
+        await update.message.reply_text(f"{ce('info')} <b>No custom GFX.</b>", parse_mode="HTML"); return
     try:
         with open(CUSTOM_GFX_FILE, "r", encoding="utf-8") as f: code = f.read()
         bio = io.BytesIO(code.encode("utf-8")); bio.name = "custom_gfx.py"
@@ -1431,12 +1454,10 @@ async def cmd_testgfx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if not args:
         await update.message.reply_text(f"{ce('info')} <b>Usage:</b> <code>/testgfx @username</code>",
-                                        parse_mode="HTML")
-        return
+                                        parse_mode="HTML"); return
     clean = normalize_username(args[0])
     if not clean:
-        await update.message.reply_text(f"{ce('cross')} <b>Invalid.</b>", parse_mode="HTML")
-        return
+        await update.message.reply_text(f"{ce('cross')} <b>Invalid.</b>", parse_mode="HTML"); return
     thinking = await update.message.reply_text(f"{ce('time')} <b>Generating…</b>", parse_mode="HTML")
     try:
         dn = clean; pb = None
@@ -1459,21 +1480,23 @@ async def cmd_testgfx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio = func(clean, dn, reports, victims, total, pb, status,
                        rating=rating, rating_count=rating_count, trusted=trusted)
         except Exception as e:
-            log.exception("testgfx custom")
-            await thinking.edit_text(f"{ce('cross')} <b>Custom failed:</b>\n<code>{html.escape(str(e)[:300])}</code>",
+            log.exception("testgfx")
+            await thinking.edit_text(f"{ce('cross')} <b>Failed:</b> <code>{html.escape(str(e)[:300])}</code>",
                                      parse_mode="HTML")
             return
         if bio is None:
-            await thinking.edit_text(f"{ce('cross')} <b>Returned None.</b>", parse_mode="HTML")
+            await thinking.edit_text(f"{ce('cross')} <b>Returned None.</b>\n\n<i>Check /terminal</i>",
+                                     parse_mode="HTML")
             return
         await thinking.delete()
-        await update.message.reply_photo(photo=bio,
-            caption=f"{ce('check')} <b>GFX [{label}]</b> for @{clean}\nStatus: <b>{status}</b>")
+        await update.message.reply_photo(
+            photo=bio,
+            caption=(f"{ce('check')} <b>GFX [{label}]</b> for @{clean}\n"
+                     f"Status: <b>{status}</b>"),
+            parse_mode="HTML")
     except Exception as e:
-        log.exception("testgfx")
         try:
-            await thinking.edit_text(f"{ce('cross')} <b>Error:</b> <code>{html.escape(str(e)[:300])}</code>",
-                                     parse_mode="HTML")
+            await thinking.edit_text(f"{ce('cross')} <b>{html.escape(str(e)[:300])}</b>", parse_mode="HTML")
         except Exception: pass
 
 # ============================================================
@@ -1483,8 +1506,7 @@ async def cmd_addfixcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     context.user_data["await_fix_code"] = True
     await update.message.reply_text(
-        f"{ce('info')} <b>Add Custom Fix Code</b>\n\n"
-        f"Send Python code. Exec in globals — overrides functions.\n\n/cancel to abort.",
+        f"{ce('info')} <b>Send Python code (exec in globals).</b>\n\n/cancel to abort.",
         parse_mode="HTML")
 
 async def recv_fix_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1498,36 +1520,30 @@ async def recv_fix_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = re.sub(r"\n?```\s*$", "", code)
     try: compile(code, "<custom_fix>", "exec")
     except SyntaxError as e:
-        await msg.reply_text(f"{ce('cross')} <b>Syntax error:</b>\n<code>{html.escape(str(e))}</code>",
-                             parse_mode="HTML")
+        await msg.reply_text(f"{ce('cross')} <b>Syntax:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
         return
     try:
         with open(CUSTOM_FIX_FILE, "w", encoding="utf-8") as f: f.write(code)
     except Exception as e:
-        await msg.reply_text(f"{ce('cross')} <b>Save failed:</b> <code>{html.escape(str(e))}</code>",
-                             parse_mode="HTML")
+        await msg.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
         return
     ok = reload_fix()
     context.user_data.pop("await_fix_code", None)
-    if not ok:
-        await msg.reply_text(f"{ce('warning')} <b>Saved but failed to load.</b>", parse_mode="HTML")
-        return
-    await msg.reply_text(f"{ce('check')} <b>Custom fix saved!</b>", parse_mode="HTML")
+    await msg.reply_text(f"{ce('check')} <b>Fix saved!</b>" if ok else f"{ce('warning')} <b>Saved but load failed.</b>",
+                         parse_mode="HTML")
 
 async def cmd_removefixcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     try:
         if os.path.exists(CUSTOM_FIX_FILE): os.remove(CUSTOM_FIX_FILE)
-        await update.message.reply_text(
-            f"{ce('warning')} <b>Fix removed.</b>\n\nBot restart karo.", parse_mode="HTML")
+        await update.message.reply_text(f"{ce('warning')} <b>Removed. Restart bot.</b>", parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
 async def cmd_showfixcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     if not os.path.exists(CUSTOM_FIX_FILE):
-        await update.message.reply_text(f"{ce('info')} <b>No custom fix.</b>", parse_mode="HTML")
-        return
+        await update.message.reply_text(f"{ce('info')} <b>No custom fix.</b>", parse_mode="HTML"); return
     try:
         with open(CUSTOM_FIX_FILE, "r", encoding="utf-8") as f: code = f.read()
         bio = io.BytesIO(code.encode("utf-8")); bio.name = "custom_fix.py"
@@ -1536,7 +1552,7 @@ async def cmd_showfixcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
 # ============================================================
-# NEW ADMIN COMMANDS
+# ADMIN COMMANDS
 # ============================================================
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
@@ -1544,8 +1560,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         context.user_data["await_broadcast"] = True
         await update.message.reply_text(f"{ce('info')} <b>Send broadcast message.</b>\n\n/cancel to abort.",
-                                        parse_mode="HTML")
-        return
+                                        parse_mode="HTML"); return
     await _do_broadcast(update, context, " ".join(args))
 
 async def recv_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1559,30 +1574,25 @@ async def recv_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _do_broadcast(update, context, text):
     con = db(); cur = con.cursor()
     cur.execute("SELECT DISTINCT reporter_id FROM reports WHERE reporter_id > 0")
-    users = [r[0] for r in cur.fetchall()]
-    con.close()
+    users = [r[0] for r in cur.fetchall()]; con.close()
     if not users:
-        await update.message.reply_text(f"{ce('info')} <b>No users.</b>", parse_mode="HTML")
-        return
-    status = await update.message.reply_text(f"{ce('time')} <b>Broadcasting to {len(users)}…</b>",
-                                             parse_mode="HTML")
+        await update.message.reply_text(f"{ce('info')} <b>No users.</b>", parse_mode="HTML"); return
+    status = await update.message.reply_text(f"{ce('time')} <b>Broadcasting to {len(users)}…</b>", parse_mode="HTML")
     ok = 0; fail = 0
     msg = f"{ce('info')} <b>DealFound Update</b>\n\n{html.escape(text)}"
     for uid in users:
         if uid in ADMIN_IDS: continue
         try:
             await context.bot.send_message(uid, msg, parse_mode="HTML", disable_web_page_preview=True)
-            ok += 1
-            await asyncio.sleep(0.05)
+            ok += 1; await asyncio.sleep(0.05)
         except Exception: fail += 1
     try:
-        await status.edit_text(f"{ce('check')} <b>Done</b>\n\nSent: <b>{ok}</b>\nFailed: <b>{fail}</b>",
-                               parse_mode="HTML")
+        await status.edit_text(f"{ce('check')} <b>Done</b>\n\nSent: <b>{ok}</b>\nFailed: <b>{fail}</b>", parse_mode="HTML")
     except Exception: pass
 
 async def cmd_restartbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
-    await update.message.reply_text(f"{ce('warning')} <b>Restarting bot…</b>", parse_mode="HTML")
+    await update.message.reply_text(f"{ce('warning')} <b>Restarting…</b>", parse_mode="HTML")
     await asyncio.sleep(1)
     try: await shutdown_resolver()
     except Exception: pass
@@ -1593,8 +1603,7 @@ async def cmd_backupdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     try:
         if not os.path.exists(DB_PATH):
-            await update.message.reply_text(f"{ce('cross')} <b>DB not found.</b>", parse_mode="HTML")
-            return
+            await update.message.reply_text(f"{ce('cross')} <b>DB not found.</b>", parse_mode="HTML"); return
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         fname = f"dealfound_backup_{ts}.db"
         with open(DB_PATH, "rb") as f: bio = io.BytesIO(f.read())
@@ -1612,97 +1621,21 @@ async def cmd_clearidcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
         before = cur.fetchone()[0] or 0
         cur.execute("DELETE FROM user_cache")
         con.commit(); con.close()
-        await update.message.reply_text(f"{ce('check')} <b>Cache cleared ({before})</b>", parse_mode="HTML")
+        await update.message.reply_text(f"{ce('check')} <b>Cleared ({before})</b>", parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     con = db(); cur = con.cursor()
-    cur.execute("SELECT COUNT(DISTINCT reporter_id) FROM reports")
-    tu = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM reports")
-    tr = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM user_cache")
-    cn = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM trusted_users")
-    tn = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(DISTINCT reporter_id) FROM reports"); tu = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM reports"); tr = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM user_cache"); cn = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM trusted_users"); tn = cur.fetchone()[0] or 0
     con.close()
     await update.message.reply_text(
-        f"{ce('info')} <b>Bot Users</b>\n\n"
-        f"Unique reporters: <b>{tu}</b>\nTotal reports: <b>{tr}</b>\n"
-        f"Cached IDs: <b>{cn}</b>\nTrusted users: <b>{tn}</b>",
+        f"{ce('info')} <b>Bot Users</b>\n\nUnique: <b>{tu}</b>\nReports: <b>{tr}</b>\nCache: <b>{cn}</b>\nTrusted: <b>{tn}</b>",
         parse_mode="HTML")
-
-async def cb_ad_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS: return
-    await safe_answer(q)
-    context.user_data["await_broadcast"] = True
-    await q.message.reply_text(f"{ce('info')} <b>Send broadcast message.</b>\n\n/cancel to abort.",
-                               parse_mode="HTML")
-
-async def cb_ad_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS: return
-    await safe_answer(q)
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT COUNT(DISTINCT reporter_id) FROM reports")
-    tu = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM reports")
-    tr = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM user_cache")
-    cn = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM trusted_users")
-    tn = cur.fetchone()[0] or 0
-    con.close()
-    await safe_edit(q,
-        f"{ce('info')} <b>Bot Users</b>\n\nUnique: <b>{tu}</b>\nReports: <b>{tr}</b>\n"
-        f"Cache: <b>{cn}</b>\nTrusted: <b>{tn}</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
-
-async def cb_ad_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS: return
-    await safe_answer(q)
-    if not os.path.exists(DB_PATH):
-        await q.message.reply_text(f"{ce('cross')} <b>DB not found.</b>", parse_mode="HTML")
-        return
-    try:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        fname = f"dealfound_backup_{ts}.db"
-        with open(DB_PATH, "rb") as f: bio = io.BytesIO(f.read())
-        bio.name = fname
-        await q.message.reply_document(document=bio, filename=fname,
-            caption=f"{ce('check')} <b>DB Backup</b>")
-    except Exception as e:
-        await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
-
-async def cb_ad_clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS: return
-    await safe_answer(q, "Clearing…")
-    try:
-        con = db(); cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM user_cache")
-        before = cur.fetchone()[0] or 0
-        cur.execute("DELETE FROM user_cache")
-        con.commit(); con.close()
-        await q.message.reply_text(f"{ce('check')} <b>Cache cleared ({before})</b>", parse_mode="HTML")
-    except Exception as e:
-        await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
-
-async def cb_ad_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or _uid(q) not in ADMIN_IDS: return
-    await safe_answer(q, "Restarting…")
-    await q.message.reply_text(f"{ce('warning')} <b>Restarting bot…</b>", parse_mode="HTML")
-    await asyncio.sleep(1)
-    try: await shutdown_resolver()
-    except Exception: pass
-    python = sys.executable
-    os.execv(python, [python] + sys.argv)
 
 # ============================================================
 # TERMINAL
@@ -1710,13 +1643,11 @@ async def cb_ad_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     if not LOG_BUFFER:
-        await update.message.reply_text(f"{ce('info')} <b>Log empty.</b>", parse_mode="HTML")
-        return
+        await update.message.reply_text(f"{ce('info')} <b>Log empty.</b>", parse_mode="HTML"); return
     lines = list(LOG_BUFFER)[-50:]
     text = "\n".join(lines)
     if len(text) > 3500: text = text[-3500:]
-    await update.message.reply_text(f"{ce('list')} <b>Last {len(lines)} lines:</b>\n\n<pre>{html.escape(text)}</pre>",
-                                    parse_mode="HTML")
+    await update.message.reply_text(f"{ce('list')} <b>Logs:</b>\n\n<pre>{html.escape(text)}</pre>", parse_mode="HTML")
 
 async def cmd_terminalstart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
@@ -1745,7 +1676,7 @@ async def cmd_session_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if client:
                 me = await client.get_me()
                 r = f"OK @{getattr(me,'username','?')} (id={me.id})"
-            else: r = "File exists but not authorized"
+            else: r = "File exists, not authorized"
         except Exception as e: r = f"Error: {e}"
     await update.message.reply_text(f"{ce('info')} <b>Session:</b> {html.escape(r)}", parse_mode="HTML")
 
@@ -1768,16 +1699,14 @@ async def cb_ad_termstart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q, "Live ON")
-    LIVE_LOG_ON["enabled"] = True
-    LIVE_LOG_USERS.add(_uid(q))
+    LIVE_LOG_ON["enabled"] = True; LIVE_LOG_USERS.add(_uid(q))
     await cb_ad_term(update, context)
 
 async def cb_ad_termstop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q, "Live OFF")
-    LIVE_LOG_ON["enabled"] = False
-    LIVE_LOG_USERS.discard(_uid(q))
+    LIVE_LOG_ON["enabled"] = False; LIVE_LOG_USERS.discard(_uid(q))
     await cb_ad_term(update, context)
 
 async def cb_ad_termshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1785,13 +1714,11 @@ async def cb_ad_termshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     if not LOG_BUFFER:
-        await q.message.reply_text(f"{ce('info')} <b>Log empty.</b>", parse_mode="HTML")
-        return
+        await q.message.reply_text(f"{ce('info')} <b>Empty.</b>", parse_mode="HTML"); return
     lines = list(LOG_BUFFER)[-50:]
     text = "\n".join(lines)
     if len(text) > 3500: text = text[-3500:]
-    await q.message.reply_text(f"{ce('list')} <b>Last {len(lines)}:</b>\n\n<pre>{html.escape(text)}</pre>",
-                               parse_mode="HTML")
+    await q.message.reply_text(f"{ce('list')} <b>Logs:</b>\n\n<pre>{html.escape(text)}</pre>", parse_mode="HTML")
 
 async def cb_ad_termclr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1812,7 +1739,7 @@ async def cb_ad_sessinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if client:
                 me = await client.get_me()
                 r = f"OK @{getattr(me,'username','?')} (id={me.id})"
-            else: r = "File exists but not authorized"
+            else: r = "File exists, not authorized"
         except Exception as e: r = f"Error: {e}"
     await q.message.reply_text(f"{ce('info')} <b>Session:</b> {html.escape(r)}", parse_mode="HTML")
 
@@ -1880,17 +1807,18 @@ async def recv_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
     v = update.message.text.strip()
     if not v.isdigit():
-        await safe_reply(update.message, f"{ce('cross')} <b>Numeric only.</b>", parse_mode="HTML")
-        return
+        await safe_reply(update.message, f"{ce('cross')} <b>Numeric only.</b>", parse_mode="HTML"); return
     set_scammer_id(rid, int(v))
     context.user_data.pop("df_mode", None); context.user_data.pop("df_wait_rid", None)
     await safe_reply(update.message, f"{ce('check')} <b>ID saved: {v}</b>", parse_mode="HTML")
 
 # ============================================================
-# PUBLISH — tg://user → tg://openmessage → username
+# PUBLISH — with Copy UID + Impersonator
 # ============================================================
 async def _publish_report(bot, deal):
-    (rid, r_id, r_un, s_un, s_id, amt, desc, proof, status, cat, rat) = deal
+    (rid, r_id, r_un, s_un, s_id, amt, desc, proof, status, cat, rat) = deal[:11]
+    imp = deal[13] if len(deal) > 13 else ""
+    proof_archive = deal[11] if len(deal) > 11 else ""
     clean = str(s_un or "").strip().lstrip("@").strip()
     try: stored_id = int(s_id) if s_id else 0
     except Exception: stored_id = 0
@@ -1904,7 +1832,6 @@ async def _publish_report(bot, deal):
         except Exception: resolved_id = 0
     final_id = resolved_id or stored_id
 
-    # Caption with tg://user link (best for caption)
     if clean and not clean.startswith("id"):
         if final_id and final_id > 0:
             name_disp = f'<a href="tg://user?id={final_id}">@{html.escape(clean)}</a>'
@@ -1919,46 +1846,46 @@ async def _publish_report(bot, deal):
                f"<b>has been reported as a scammer following DF Team review.</b>")
     if final_id and final_id > 0:
         caption += f"\n🆔 <b>User ID:</b> <code>{final_id}</code>"
+    if imp:
+        caption += f"\n🎭 <b>Impersonating:</b> {html.escape(imp)}"
+    if proof_archive:
+        caption += f"\n📁 <b>Proof archived</b>"
 
-    # ============ BUTTON ATTEMPTS — tg://user FIRST ============
+    copy_btn = None
+    if final_id and final_id > 0:
+        try:
+            copy_btn = InlineKeyboardButton("Copy User ID", copy_text={"text": str(final_id)})
+        except Exception:
+            copy_btn = None
+
     proof_btn = None
     if proof and proof.startswith("http"):
         proof_btn = InlineKeyboardButton("View Proof", url=proof)
 
     attempts = []
-
-    # 1. tg://user?id=ID
     if final_id and final_id > 0:
         row = [InlineKeyboardButton("View Profile", url=f"tg://user?id={final_id}")]
         if proof_btn: row.append(proof_btn)
         attempts.append([row])
-
-    # 2. tg://openmessage?user_id=ID
     if final_id and final_id > 0:
         row = [InlineKeyboardButton("View Profile", url=f"tg://openmessage?user_id={final_id}")]
         if proof_btn: row.append(proof_btn)
         attempts.append([row])
-
-    # 3. https://t.me/username (GUARANTEED FALLBACK)
     if clean and not clean.startswith("id"):
         row = [InlineKeyboardButton("View Profile", url=f"https://t.me/{clean}")]
         if proof_btn: row.append(proof_btn)
         attempts.append([row])
-    elif clean.startswith("id") and len(clean) > 2:
-        row = [InlineKeyboardButton("View Profile", url=f"https://t.me/{clean[2:]}")]
-        if proof_btn: row.append(proof_btn)
-        attempts.append([row])
-
-    # 4. Proof only
     if proof_btn:
         attempts.append([[proof_btn]])
-
-    # 5. No buttons
     attempts.append(None)
+
+    if copy_btn:
+        for i, rows in enumerate(attempts):
+            if rows is not None:
+                attempts[i] = rows + [[copy_btn]]
 
     all_rows = attempts[0] if attempts else []
 
-    # Banner
     saved = get_banner()
     gfx = None
     if PILLOW_OK and not saved:
@@ -1976,11 +1903,9 @@ async def _publish_report(bot, deal):
             gfx = func(clean if not clean.startswith("id") else f"id{final_id}",
                        dn, reports, victims, total, pb, "SCAMMER")
         except Exception as e:
-            log.error(f"[GFX] Custom failed: {e}")
-            gfx = make_banner(clean if not clean.startswith("id") else f"id{final_id}",
-                              dn, reports, victims, total, pb, "SCAMMER")
+            log.error(f"[GFX] {e}")
+            gfx = None
 
-    # Send with fallback chain
     labels = ["tg_user", "openmessage", "username", "proof_only", "no_buttons"]
     sent = None; last_err = None; used = None
     for idx, rows in enumerate(attempts):
@@ -2047,12 +1972,11 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_report_status(rid, "rejected")
         try: await safe_send(context.bot, rep[1], f"{ce('cross')} <b>Report #{rid} Rejected</b>", parse_mode="HTML")
         except Exception: pass
-        await safe_edit(q, f"{ce('cross')} <b>Report #{rid} rejected.</b>", parse_mode="HTML")
-        return
+        await safe_edit(q, f"{ce('cross')} <b>Rejected.</b>", parse_mode="HTML"); return
     sent, mode = await _publish_report(context.bot, rep)
     if sent is None:
         try:
-            await q.message.reply_text(f"{ce('cross')} <b>Publish failed:</b> <code>{html.escape(str(mode))}</code>",
+            await q.message.reply_text(f"{ce('cross')} <b>Failed:</b> <code>{html.escape(str(mode))}</code>",
                                        parse_mode="HTML")
         except Exception: pass
         return
@@ -2060,8 +1984,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await safe_send(context.bot, rep[1], f"{ce('check')} <b>Report #{rid} Approved</b>", parse_mode="HTML")
     except Exception: pass
-    await safe_edit(q, f"{ce('check')} <b>Report #{rid} approved.</b>\nMode: <b>{html.escape(str(mode))}</b>",
-                    parse_mode="HTML")
+    await safe_edit(q, f"{ce('check')} <b>Approved.</b>\nMode: <b>{html.escape(str(mode))}</b>", parse_mode="HTML")
 
 # ============================================================
 # BULK REPUBLISH
@@ -2079,12 +2002,11 @@ async def _bulk_republish(bot, chat_id):
             old = get_report_post(rid)
             if old:
                 try: await bot.delete_message(chat_id=old[0], message_id=old[1])
-                except Exception as e: log.warning(f"[BulkRepub] del #{rid}: {e}")
+                except Exception as e: log.warning(f"[BulkRepub] {rid}: {e}")
             sent, mode = await _publish_report(bot, rep)
             if sent is None:
                 failed += 1; errors.append(f"#{rid}: {mode}"); continue
-            success += 1
-            await asyncio.sleep(1.5)
+            success += 1; await asyncio.sleep(1.5)
         except Exception as e:
             failed += 1; errors.append(f"#{rid}: {str(e)[:50]}")
     return success, failed, errors
@@ -2095,13 +2017,12 @@ async def cb_ad_repuball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(q)
     con = db(); cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM reports WHERE status='approved'")
-    count = cur.fetchone()[0] or 0
-    con.close()
+    count = cur.fetchone()[0] or 0; con.close()
     if count == 0:
-        await safe_edit(q, f"{ce('info')} <b>No approved reports.</b>", parse_mode="HTML",
+        await safe_edit(q, f"{ce('info')} <b>None.</b>", parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
         return
-    await safe_edit(q, f"{ce('warning')} <b>Republish All</b>\n\nTotal: <b>{count}</b>\n~{count*2} sec\n\nSure?",
+    await safe_edit(q, f"{ce('warning')} <b>Republish All</b>\n\nTotal: <b>{count}</b>\n\nSure?",
                     parse_mode="HTML", reply_markup=repuball_kb())
 
 async def cb_ad_repuball_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2110,8 +2031,8 @@ async def cb_ad_repuball_yes(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await safe_answer(q)
     msg = await q.message.reply_text(f"{ce('time')} <b>Republishing…</b>", parse_mode="HTML")
     success, failed, errors = await _bulk_republish(context.bot, REPORT_CHANNEL_ID)
-    txt = f"{ce('check')} <b>Done!</b>\n\nSuccess: <b>{success}</b>\nFailed: <b>{failed}</b>"
-    if errors: txt += f"\n\n<b>Errors:</b>\n<code>{html.escape(chr(10).join(errors[:5]))}</code>"
+    txt = f"{ce('check')} <b>Done</b>\n\nSuccess: <b>{success}</b>\nFailed: <b>{failed}</b>"
+    if errors: txt += f"\n\n<code>{html.escape(chr(10).join(errors[:5]))}</code>"
     try: await msg.edit_text(txt, parse_mode="HTML")
     except Exception: await msg.reply_text(txt, parse_mode="HTML")
 
@@ -2154,28 +2075,20 @@ async def cb_ad_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     con = db(); cur = con.cursor()
-    cur.execute("SELECT status, COUNT(*) FROM reports GROUP BY status")
-    rr = dict(cur.fetchall())
-    cur.execute("SELECT status, COUNT(*) FROM appeals GROUP BY status")
-    ar = dict(cur.fetchall())
-    cur.execute("SELECT COUNT(*) FROM custom_buttons")
-    btns = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM reports WHERE scammer_user_id=0 AND status='approved'")
-    noid = cur.fetchone()[0] or 0
-    cur.execute("SELECT COUNT(*) FROM trusted_users")
-    trs = cur.fetchone()[0] or 0
+    cur.execute("SELECT status, COUNT(*) FROM reports GROUP BY status"); rr = dict(cur.fetchall())
+    cur.execute("SELECT status, COUNT(*) FROM appeals GROUP BY status"); ar = dict(cur.fetchall())
+    cur.execute("SELECT COUNT(*) FROM custom_buttons"); btns = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM reports WHERE scammer_user_id=0 AND status='approved'"); noid = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM trusted_users"); trs = cur.fetchone()[0] or 0
     con.close()
     sess = _session_exists()
-    gfx_s = "CUSTOM" if os.path.exists(CUSTOM_GFX_FILE) else "DEFAULT"
-    fix_s = "LOADED" if os.path.exists(CUSTOM_FIX_FILE) else "NONE"
     text = (f"{ce('star')} <b>Stats</b>\n\n"
             f"Reports: P{rr.get('pending',0)} A{rr.get('approved',0)} R{rr.get('rejected',0)}\n"
             f"Appeals: P{ar.get('pending',0)} A{ar.get('accepted',0)} R{ar.get('rejected',0)}\n"
-            f"Buttons: {btns} Trusted: {trs}\n"
-            f"No ID: {noid}\nGFX: {gfx_s}\nFix: {fix_s}\n"
+            f"Buttons: {btns} Trusted: {trs}\nNo ID: {noid}\n"
             f"Session: {'OK' if sess else 'MISSING'}\n"
-            f"Telethon: {'ON' if TELETHON_OK else 'OFF'}\n"
-            f"Pillow: {'ON' if PILLOW_OK else 'OFF'}")
+            f"Telethon: {'ON' if TELETHON_OK else 'OFF'}\nPillow: {'ON' if PILLOW_OK else 'OFF'}\n"
+            f"GFX Module: {'OK' if GFX_MODULE_OK else 'FAIL'}")
     await safe_edit(q, text, parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
 
@@ -2199,22 +2112,83 @@ async def cb_ad_setban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["wait_banner"] = True; context.user_data["wait_wlc"] = False
-    await q.message.reply_text(f"{ce('info')} <b>Send report banner as photo.</b>", parse_mode="HTML")
+    await q.message.reply_text(f"{ce('info')} <b>Send report banner.</b>", parse_mode="HTML")
 
 async def cb_ad_setwlc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["wait_wlc"] = True; context.user_data["wait_banner"] = False
-    await q.message.reply_text(f"{ce('info')} <b>Send welcome banner as photo.</b>", parse_mode="HTML")
+    await q.message.reply_text(f"{ce('info')} <b>Send welcome banner.</b>", parse_mode="HTML")
 
 async def cb_ad_delpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["ad_mode"] = "delpost"
-    await safe_edit(q, f"{ce('info')} <b>Send Report ID to delete:</b>", parse_mode="HTML",
+    await safe_edit(q, f"{ce('info')} <b>Send Report ID:</b>", parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
+
+async def cb_ad_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or _uid(q) not in ADMIN_IDS: return
+    await safe_answer(q)
+    context.user_data["await_broadcast"] = True
+    await q.message.reply_text(f"{ce('info')} <b>Send broadcast.</b>", parse_mode="HTML")
+
+async def cb_ad_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or _uid(q) not in ADMIN_IDS: return
+    await safe_answer(q)
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT COUNT(DISTINCT reporter_id) FROM reports"); tu = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM reports"); tr = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM user_cache"); cn = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) FROM trusted_users"); tn = cur.fetchone()[0] or 0
+    con.close()
+    await safe_edit(q,
+        f"{ce('info')} <b>Users</b>\n\nUnique: <b>{tu}</b>\nReports: <b>{tr}</b>\nCache: <b>{cn}</b>\nTrusted: <b>{tn}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
+
+async def cb_ad_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or _uid(q) not in ADMIN_IDS: return
+    await safe_answer(q)
+    if not os.path.exists(DB_PATH):
+        await q.message.reply_text(f"{ce('cross')} <b>Not found.</b>", parse_mode="HTML"); return
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        fname = f"dealfound_backup_{ts}.db"
+        with open(DB_PATH, "rb") as f: bio = io.BytesIO(f.read())
+        bio.name = fname
+        await q.message.reply_document(document=bio, filename=fname,
+            caption=f"{ce('check')} <b>Backup</b>")
+    except Exception as e:
+        await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
+
+async def cb_ad_clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or _uid(q) not in ADMIN_IDS: return
+    await safe_answer(q, "Clearing…")
+    try:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM user_cache"); before = cur.fetchone()[0] or 0
+        cur.execute("DELETE FROM user_cache"); con.commit(); con.close()
+        await q.message.reply_text(f"{ce('check')} <b>Cleared ({before})</b>", parse_mode="HTML")
+    except Exception as e:
+        await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
+
+async def cb_ad_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or _uid(q) not in ADMIN_IDS: return
+    await safe_answer(q, "Restarting…")
+    await q.message.reply_text(f"{ce('warning')} <b>Restarting…</b>", parse_mode="HTML")
+    await asyncio.sleep(1)
+    try: await shutdown_resolver()
+    except Exception: pass
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)
 
 # ============================================================
 # TRUSTED
@@ -2238,7 +2212,7 @@ async def cb_ad_marktrust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["ad_mode"] = "marktrust"
-    await safe_edit(q, f"{ce('info')} <b>Mark Trusted</b>\n\nSend <b>@username</b>:",
+    await safe_edit(q, f"{ce('info')} <b>Mark Trusted — Send @username</b>",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="ad_home")]]))
 
@@ -2264,10 +2238,10 @@ async def cb_ad_fixid(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    ORDER BY id DESC LIMIT 15""")
     rows = cur.fetchall(); con.close()
     if not rows:
-        await safe_edit(q, f"{ce('check')} <b>No reports without ID.</b>", parse_mode="HTML",
+        await safe_edit(q, f"{ce('check')} <b>None.</b>", parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
         return
-    lines = [f"{ce('warning')} <b>Missing User ID:</b>\n"]
+    lines = [f"{ce('warning')} <b>Missing ID:</b>\n"]
     kb_rows = []
     for rid, sun in rows:
         lines.append(f"<b>#{rid}</b> {html.escape(str(sun))}")
@@ -2284,7 +2258,7 @@ async def cb_fx_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rep = get_report(rid)
     if not rep: return
     await safe_edit(q,
-        f"{ce('info')} <b>Fix Report #{rid}</b>\n\nTarget: <b>{html.escape(str(rep[3]))}</b>\nCurrent ID: <code>{rep[4] or 'none'}</code>",
+        f"{ce('info')} <b>Fix #{rid}</b>\n\nTarget: <b>{html.escape(str(rep[3]))}</b>\nID: <code>{rep[4] or 'none'}</code>",
         parse_mode="HTML", reply_markup=fixid_kb(rid))
 
 async def cb_fx_fwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2294,7 +2268,7 @@ async def cb_fx_fwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: rid = int(q.data.split(":", 1)[1])
     except Exception: return
     context.user_data["fx_rid"] = rid; context.user_data["fx_mode"] = "forward"
-    await q.message.reply_text(f"<b>Forward scammer's message now.</b>\n\n/cancel to abort.", parse_mode="HTML")
+    await q.message.reply_text(f"<b>Forward scammer msg.</b>", parse_mode="HTML")
 
 async def cb_fx_man(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2303,7 +2277,7 @@ async def cb_fx_man(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: rid = int(q.data.split(":", 1)[1])
     except Exception: return
     context.user_data["fx_rid"] = rid; context.user_data["fx_mode"] = "manual"
-    await q.message.reply_text(f"<b>Send numeric User ID for #{rid}.</b>\n\n/cancel to abort.", parse_mode="HTML")
+    await q.message.reply_text(f"<b>Send numeric ID.</b>", parse_mode="HTML")
 
 async def cb_fx_repub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2314,19 +2288,15 @@ async def cb_fx_repub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rep = get_report(rid)
     if not rep: return
     if not rep[4]:
-        await q.message.reply_text(f"{ce('cross')} <b>No ID set.</b>", parse_mode="HTML")
-        return
+        await q.message.reply_text(f"{ce('cross')} <b>No ID.</b>", parse_mode="HTML"); return
     old = get_report_post(rid)
     if old:
         try: await context.bot.delete_message(chat_id=old[0], message_id=old[1])
         except Exception as e: log.warning(f"del: {e}")
     sent, mode = await _publish_report(context.bot, rep)
     if sent is None:
-        await q.message.reply_text(f"{ce('cross')} <b>Failed:</b> <code>{html.escape(str(mode))}</code>",
-                                   parse_mode="HTML")
-        return
-    await q.message.reply_text(f"{ce('check')} <b>Republished #{rid}</b>\nMode: {html.escape(str(mode))}",
-                               parse_mode="HTML")
+        await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(mode))}</b>", parse_mode="HTML"); return
+    await q.message.reply_text(f"{ce('check')} <b>Republished #{rid}</b>\n{mode}", parse_mode="HTML")
 
 async def recv_fx_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
@@ -2339,22 +2309,16 @@ async def recv_fx_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("fx_mode", None); context.user_data.pop("fx_rid", None)
         if uid:
             set_scammer_id(rid, uid)
-            await update.message.reply_text(
-                f"{ce('check')} <b>ID saved:</b> <code>{uid}</code>\n\nTap <b>Republish</b>.",
-                parse_mode="HTML", reply_markup=fixid_kb(rid))
-        else:
-            await update.message.reply_text(f"{ce('warning')} <b>Could not extract.</b>", parse_mode="HTML")
+            await update.message.reply_text(f"{ce('check')} <b>Saved: {uid}</b>", parse_mode="HTML",
+                                            reply_markup=fixid_kb(rid))
     elif mode == "manual":
-        if not update.message or not update.message.text: return
-        v = update.message.text.strip()
+        v = (update.message.text or "").strip()
         if not v.isdigit():
-            await safe_reply(update.message, f"{ce('cross')} <b>Numeric only.</b>", parse_mode="HTML")
-            return
+            await safe_reply(update.message, f"{ce('cross')} <b>Numeric only.</b>", parse_mode="HTML"); return
         set_scammer_id(rid, int(v))
         context.user_data.pop("fx_mode", None); context.user_data.pop("fx_rid", None)
-        await update.message.reply_text(
-            f"{ce('check')} <b>ID saved:</b> <code>{v}</code>\n\nTap <b>Republish</b>.",
-            parse_mode="HTML", reply_markup=fixid_kb(rid))
+        await update.message.reply_text(f"{ce('check')} <b>Saved: {v}</b>", parse_mode="HTML",
+                                        reply_markup=fixid_kb(rid))
 
 # ============================================================
 # CUSTOM BUTTONS
@@ -2367,27 +2331,22 @@ async def cb_ad_addbtn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(q)
     try: context.user_data.clear()
     except Exception: pass
-    await safe_edit(q, f"{ce('info')} <b>Add Custom Button — Step 1/3</b>\n\n<b>Enter label:</b>",
-                    parse_mode="HTML",
+    await safe_edit(q, f"{ce('info')} <b>Step 1/3 — Enter label:</b>", parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="ad_home")]]))
     return BTN_LABEL
 
 async def btn_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return BTN_LABEL
-    label = update.message.text.strip()
+    label = (update.message.text or "").strip()
     if len(label) < 1 or len(label) > 50:
-        await safe_reply(update.message, f"{ce('cross')} <b>1-50 chars.</b>", parse_mode="HTML")
-        return BTN_LABEL
+        await safe_reply(update.message, f"{ce('cross')} <b>1-50 chars.</b>", parse_mode="HTML"); return BTN_LABEL
     context.user_data["btn_label"] = label
     await safe_reply(update.message, f"{ce('info')} <b>Step 2/3 — URL:</b>", parse_mode="HTML")
     return BTN_URL
 
 async def btn_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return BTN_URL
-    url = update.message.text.strip()
+    url = (update.message.text or "").strip()
     if not (url.startswith("https://") or url.startswith("http://") or url.startswith("tg://")):
-        await safe_reply(update.message, f"{ce('cross')} <b>Must start with http/https/tg</b>", parse_mode="HTML")
-        return BTN_URL
+        await safe_reply(update.message, f"{ce('cross')} <b>http/https/tg only</b>", parse_mode="HTML"); return BTN_URL
     context.user_data["btn_url"] = url
     await safe_reply(update.message, f"{ce('info')} <b>Step 3/3 — Location:</b>",
                      parse_mode="HTML", reply_markup=btn_loc_kb())
@@ -2398,15 +2357,14 @@ async def btn_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return ConversationHandler.END
     await safe_answer(q)
     loc = q.data.split(":", 1)[1]
-    label = context.user_data.get("btn_label")
-    url = context.user_data.get("btn_url")
+    label = context.user_data.get("btn_label"); url = context.user_data.get("btn_url")
     if not (label and url):
-        await safe_edit(q, f"{ce('cross')} <b>Session expired.</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
+        await safe_edit(q, f"{ce('cross')} <b>Expired.</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
         return ConversationHandler.END
     add_custom_button(label, url, loc)
     try: context.user_data.clear()
     except Exception: pass
-    await safe_edit(q, f"{ce('check')} <b>Button Added!</b>\n\n<b>{html.escape(label)}</b>\nLocation: {loc}",
+    await safe_edit(q, f"{ce('check')} <b>Added: {html.escape(label)} ({loc})</b>",
                     parse_mode="HTML", reply_markup=admin_panel_kb())
     return ConversationHandler.END
 
@@ -2414,7 +2372,8 @@ async def btn_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: context.user_data.clear()
     except Exception: pass
     try:
-        await update.message.reply_text(f"{ce('cross')} <b>Cancelled.</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
+        await update.message.reply_text(f"{ce('cross')} <b>Cancelled.</b>", parse_mode="HTML",
+                                        reply_markup=admin_panel_kb())
     except Exception: pass
     return ConversationHandler.END
 
@@ -2424,13 +2383,12 @@ async def cb_ad_listbtn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(q)
     rows = list_custom_buttons(location=None, active_only=False)
     if not rows:
-        await safe_edit(q, f"{ce('info')} <b>No custom buttons.</b>", parse_mode="HTML",
+        await safe_edit(q, f"{ce('info')} <b>None.</b>", parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="ad_home")]]))
         return
-    kb_rows = []
-    lines = [f"{ce('list')} <b>Buttons ({len(rows)})</b>\n"]
+    kb_rows = []; lines = [f"{ce('list')} <b>Buttons ({len(rows)})</b>\n"]
     for bid, label, url, loc, color, order, active in rows:
-        status = "ON " if active else "OFF"
+        status = "ON" if active else "OFF"
         lines.append(f"[{status}] <b>#{bid}</b> {html.escape(label)} -> {loc}")
         kb_rows.append([
             InlineKeyboardButton(f"{'Disable' if active else 'Enable'} #{bid}", callback_data=f"btn_tog:{bid}"),
@@ -2462,17 +2420,14 @@ async def cb_ad_gfx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     has = os.path.exists(CUSTOM_GFX_FILE)
-    size = 0
-    if has:
-        try: size = os.path.getsize(CUSTOM_GFX_FILE)
-        except Exception: pass
+    mod = "OK" if GFX_MODULE_OK else "FAIL"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Add/Replace", callback_data="gfx_add"),
          InlineKeyboardButton("View", callback_data="gfx_view")],
         [InlineKeyboardButton("Remove", callback_data="gfx_rm")],
         [InlineKeyboardButton("Back", callback_data="ad_home")],
     ])
-    await safe_edit(q, f"{ce('info')} <b>Custom GFX</b>\n\n{'CUSTOM' if has else 'DEFAULT'}\nSize: {size}",
+    await safe_edit(q, f"{ce('info')} <b>GFX</b>\n\nCustom: <b>{'YES' if has else 'NO'}</b>\nModule: <b>{mod}</b>",
                     parse_mode="HTML", reply_markup=kb)
 
 async def cb_gfx_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2480,15 +2435,14 @@ async def cb_gfx_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["await_gfx_code"] = True
-    await q.message.reply_text(f"{ce('info')} <b>Send Python code with make_banner.</b>", parse_mode="HTML")
+    await q.message.reply_text(f"{ce('info')} <b>Send code with make_banner.</b>", parse_mode="HTML")
 
 async def cb_gfx_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     if not os.path.exists(CUSTOM_GFX_FILE):
-        await q.message.reply_text(f"{ce('info')} <b>No custom GFX.</b>", parse_mode="HTML")
-        return
+        await q.message.reply_text(f"{ce('info')} <b>None.</b>", parse_mode="HTML"); return
     try:
         with open(CUSTOM_GFX_FILE, "r", encoding="utf-8") as f: code = f.read()
         bio = io.BytesIO(code.encode("utf-8")); bio.name = "custom_gfx.py"
@@ -2503,7 +2457,7 @@ async def cb_gfx_rm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if os.path.exists(CUSTOM_GFX_FILE): os.remove(CUSTOM_GFX_FILE)
         reload_gfx()
-        await q.message.reply_text(f"{ce('check')} <b>Custom GFX removed.</b>", parse_mode="HTML")
+        await q.message.reply_text(f"{ce('check')} <b>Removed.</b>", parse_mode="HTML")
     except Exception as e:
         await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
@@ -2512,33 +2466,27 @@ async def cb_ad_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     has = os.path.exists(CUSTOM_FIX_FILE)
-    size = 0
-    if has:
-        try: size = os.path.getsize(CUSTOM_FIX_FILE)
-        except Exception: pass
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Add Fix", callback_data="fix_add"),
          InlineKeyboardButton("View", callback_data="fix_view")],
         [InlineKeyboardButton("Remove", callback_data="fix_rm")],
         [InlineKeyboardButton("Back", callback_data="ad_home")],
     ])
-    await safe_edit(q, f"{ce('info')} <b>Custom Fix</b>\n\n{'LOADED' if has else 'NONE'}\nSize: {size}",
-                    parse_mode="HTML", reply_markup=kb)
+    await safe_edit(q, f"{ce('info')} <b>Fix:</b> {'LOADED' if has else 'NONE'}", parse_mode="HTML", reply_markup=kb)
 
 async def cb_fix_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     context.user_data["await_fix_code"] = True
-    await q.message.reply_text(f"{ce('info')} <b>Send Python code now.</b>", parse_mode="HTML")
+    await q.message.reply_text(f"{ce('info')} <b>Send Python code.</b>", parse_mode="HTML")
 
 async def cb_fix_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or _uid(q) not in ADMIN_IDS: return
     await safe_answer(q)
     if not os.path.exists(CUSTOM_FIX_FILE):
-        await q.message.reply_text(f"{ce('info')} <b>No custom fix.</b>", parse_mode="HTML")
-        return
+        await q.message.reply_text(f"{ce('info')} <b>None.</b>", parse_mode="HTML"); return
     try:
         with open(CUSTOM_FIX_FILE, "r", encoding="utf-8") as f: code = f.read()
         bio = io.BytesIO(code.encode("utf-8")); bio.name = "custom_fix.py"
@@ -2552,7 +2500,7 @@ async def cb_fix_rm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(q)
     try:
         if os.path.exists(CUSTOM_FIX_FILE): os.remove(CUSTOM_FIX_FILE)
-        await q.message.reply_text(f"{ce('warning')} <b>Fix removed.</b>\nBot restart.", parse_mode="HTML")
+        await q.message.reply_text(f"{ce('warning')} <b>Removed. Restart.</b>", parse_mode="HTML")
     except Exception as e:
         await q.message.reply_text(f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
 
@@ -2571,12 +2519,11 @@ async def recv_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rid = int(txt)
         old = get_report_post(rid)
         if not old:
-            await safe_reply(update.message, f"{ce('cross')} <b>No post.</b>", parse_mode="HTML")
-            return
+            await safe_reply(update.message, f"{ce('cross')} <b>No post.</b>", parse_mode="HTML"); return
         try:
             await context.bot.delete_message(chat_id=old[0], message_id=old[1])
             set_report_status(rid, "rejected")
-            await safe_reply(update.message, f"{ce('check')} <b>Post #{rid} deleted.</b>",
+            await safe_reply(update.message, f"{ce('check')} <b>Deleted #{rid}</b>",
                              parse_mode="HTML", reply_markup=admin_panel_kb())
         except Exception as e:
             await safe_reply(update.message, f"{ce('cross')} <b>{html.escape(str(e))}</b>", parse_mode="HTML")
@@ -2584,14 +2531,12 @@ async def recv_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("ad_mode", None)
         clean = normalize_username(txt)
         if not clean:
-            await safe_reply(update.message, f"{ce('cross')} <b>Invalid username.</b>", parse_mode="HTML")
-            return
+            await safe_reply(update.message, f"{ce('cross')} <b>Invalid.</b>", parse_mode="HTML"); return
         uid = await resolve_username(clean)
         if not uid:
-            await safe_reply(update.message, f"{ce('cross')} <b>Could not resolve ID.</b>", parse_mode="HTML")
-            return
+            await safe_reply(update.message, f"{ce('cross')} <b>Could not resolve.</b>", parse_mode="HTML"); return
         mark_trusted(uid, clean, _uid(update))
-        await safe_reply(update.message, f"{ce('check')} <b>Marked:</b> @{html.escape(clean)}\nID: <code>{uid}</code>",
+        await safe_reply(update.message, f"{ce('check')} <b>Trusted:</b> @{html.escape(clean)}\nID: <code>{uid}</code>",
                          parse_mode="HTML", reply_markup=admin_panel_kb())
 
 async def recv_banner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2628,8 +2573,7 @@ _login_clients = {}
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _uid(update) not in ADMIN_IDS: return
     if not TELETHON_OK:
-        await safe_reply(update.message, f"{ce('cross')} <b>Telethon not installed.</b>", parse_mode="HTML")
-        return
+        await safe_reply(update.message, f"{ce('cross')} <b>Telethon not installed.</b>", parse_mode="HTML"); return
     sess = _session_exists()
     if sess:
         try:
@@ -2637,15 +2581,14 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if client is not None:
                 me = await client.get_me()
                 await safe_reply(update.message,
-                    f"{ce('check')} <b>Already logged in</b>\n\nAccount: @{getattr(me, 'username', '?')}\nID: <code>{me.id}</code>",
-                    parse_mode="HTML")
-                return
+                    f"{ce('check')} <b>Already logged in</b>\n\n@{getattr(me, 'username', '?')} ({me.id})",
+                    parse_mode="HTML"); return
         except Exception: pass
     try: context.user_data.clear()
     except Exception: pass
     context.user_data["login_in_progress"] = True
     await safe_reply(update.message,
-        f"{ce('info')} <b>Telethon Login</b>\n\n<b>Step 1/3 — Send phone.</b>\n\nExample: <code>+919999999999</code>\n\n/cancel to abort.",
+        f"{ce('info')} <b>Telethon Login</b>\n\n<b>Step 1/3 — Send phone.</b>\n\n/cancel",
         parse_mode="HTML")
     return LOGIN_PHONE
 
@@ -2655,9 +2598,8 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text: return LOGIN_PHONE
     phone = msg.text.strip().replace(" ", "").replace("-", "")
     if not phone.startswith("+") or not phone[1:].isdigit():
-        await safe_reply(msg, f"{ce('cross')} <b>Invalid phone.</b>", parse_mode="HTML")
-        return LOGIN_PHONE
-    await safe_reply(msg, f"{ce('time')} <b>Sending OTP to</b> <code>{html.escape(phone)}</code>…", parse_mode="HTML")
+        await safe_reply(msg, f"{ce('cross')} <b>Invalid phone.</b>", parse_mode="HTML"); return LOGIN_PHONE
+    await safe_reply(msg, f"{ce('time')} <b>Sending OTP…</b>", parse_mode="HTML")
     try:
         client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
         await client.connect()
@@ -2666,8 +2608,8 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(msg, f"{ce('check')} <b>OTP sent!</b>\n\n<b>Step 2/3 — Send OTP.</b>", parse_mode="HTML")
         return LOGIN_OTP
     except Exception as e:
-        log.error(f"[Login] send_code: {e}")
-        await safe_reply(msg, f"{ce('cross')} <b>Failed.</b>\n\n<code>{html.escape(str(e)[:300])}</code>", parse_mode="HTML")
+        log.error(f"[Login] {e}")
+        await safe_reply(msg, f"{ce('cross')} <b>{html.escape(str(e)[:300])}</b>", parse_mode="HTML")
         return ConversationHandler.END
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2677,15 +2619,15 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     otp = msg.text.strip().replace(" ", "")
     data = _login_clients.get(_uid(update))
     if not data:
-        await safe_reply(msg, f"{ce('cross')} <b>Session expired.</b>", parse_mode="HTML")
-        return ConversationHandler.END
+        await safe_reply(msg, f"{ce('cross')} <b>Expired.</b>", parse_mode="HTML"); return ConversationHandler.END
     client = data["client"]; phone = data["phone"]; pch = data["phone_code_hash"]
     try:
         from telethon.errors import SessionPasswordNeededError
         try:
             await client.sign_in(phone=phone, code=otp, phone_code_hash=pch)
         except SessionPasswordNeededError:
-            await safe_reply(msg, f"{ce('warning')} <b>2FA required.</b>\n\n<b>Step 3/3 — Send 2FA.</b>", parse_mode="HTML")
+            await safe_reply(msg, f"{ce('warning')} <b>2FA required.</b>\n\n<b>Step 3/3 — Send 2FA.</b>",
+                             parse_mode="HTML")
             return LOGIN_PASSWORD
         me = await client.get_me()
         await client.disconnect()
@@ -2694,8 +2636,8 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(msg, f"{ce('check')} <b>Login OK!</b>\n\n@{getattr(me,'username','?')}", parse_mode="HTML")
         return ConversationHandler.END
     except Exception as e:
-        log.error(f"[Login] sign_in: {e}")
-        await safe_reply(msg, f"{ce('cross')} <b>OTP failed.</b>\n\n<code>{html.escape(str(e)[:300])}</code>", parse_mode="HTML")
+        log.error(f"[Login] {e}")
+        await safe_reply(msg, f"{ce('cross')} <b>{html.escape(str(e)[:300])}</b>", parse_mode="HTML")
         try: await client.disconnect()
         except Exception: pass
         _login_clients.pop(_uid(update), None)
@@ -2709,8 +2651,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pwd = msg.text.strip()
     data = _login_clients.get(_uid(update))
     if not data:
-        await safe_reply(msg, f"{ce('cross')} <b>Session expired.</b>", parse_mode="HTML")
-        return ConversationHandler.END
+        await safe_reply(msg, f"{ce('cross')} <b>Expired.</b>", parse_mode="HTML"); return ConversationHandler.END
     client = data["client"]
     try:
         await client.sign_in(password=pwd)
@@ -2721,8 +2662,8 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(msg, f"{ce('check')} <b>Login OK!</b>\n\n@{getattr(me,'username','?')}", parse_mode="HTML")
         return ConversationHandler.END
     except Exception as e:
-        log.error(f"[Login] password: {e}")
-        await safe_reply(msg, f"{ce('cross')} <b>Password failed.</b>\n\n<code>{html.escape(str(e)[:300])}</code>", parse_mode="HTML")
+        log.error(f"[Login] {e}")
+        await safe_reply(msg, f"{ce('cross')} <b>{html.escape(str(e)[:300])}</b>", parse_mode="HTML")
         try: await client.disconnect()
         except Exception: pass
         _login_clients.pop(_uid(update), None)
@@ -2738,7 +2679,7 @@ async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: context.user_data.clear()
     except Exception: pass
     try:
-        await update.message.reply_text(f"{ce('cross')} <b>Login cancelled.</b>", parse_mode="HTML", reply_markup=main_kb())
+        await update.message.reply_text(f"{ce('cross')} <b>Cancelled.</b>", parse_mode="HTML", reply_markup=main_kb())
     except Exception: pass
     return ConversationHandler.END
 
@@ -2761,6 +2702,7 @@ async def post_init(app: Application):
     global _BOT_REF
     _BOT_REF = app.bot
     log.info(f"[Startup] DB: {DB_PATH}")
+    log.info(f"[Startup] GFX Module: {'OK' if GFX_MODULE_OK else 'FAILED'}")
     if os.path.exists(CUSTOM_GFX_FILE): load_custom_gfx()
     if os.path.exists(CUSTOM_FIX_FILE): load_custom_fix()
     sess = _session_exists()
@@ -2793,10 +2735,11 @@ def main():
     report_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(report_start, pattern=r"^df_report$")],
         states={
-            DF_T: [MessageHandler(filters.TEXT & ~filters.COMMAND, r_target)],
-            DF_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, r_amount)],
-            DF_D: [MessageHandler(filters.TEXT & ~filters.COMMAND, r_desc)],
-            DF_P: [MessageHandler(filters.TEXT & ~filters.COMMAND, r_proof)],
+            DF_T:   [MessageHandler(filters.TEXT & ~filters.COMMAND, r_target)],
+            DF_A:   [MessageHandler(filters.TEXT & ~filters.COMMAND, r_amount)],
+            DF_D:   [MessageHandler(filters.TEXT & ~filters.COMMAND, r_desc)],
+            DF_P:   [MessageHandler(filters.TEXT & ~filters.COMMAND, r_proof)],
+            DF_IMP: [MessageHandler(filters.TEXT & ~filters.COMMAND, r_impersonate)],
         },
         fallbacks=[CommandHandler("cancel", report_cancel)],
         allow_reentry=True)
@@ -2826,12 +2769,10 @@ def main():
     app.add_handler(appeal_conv)
     app.add_handler(btn_conv)
 
-    # Input handlers HIGH priority
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_IDS), recv_broadcast), group=-12)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_IDS), recv_fix_code), group=-11)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_IDS), recv_gfx_code), group=-10)
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("admin", cmd_admin))
@@ -2854,7 +2795,6 @@ def main():
     app.add_handler(CommandHandler("clearidcache", cmd_clearidcache))
     app.add_handler(CommandHandler("users", cmd_users))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(cb_home, pattern=r"^df_home$"))
     app.add_handler(CallbackQueryHandler(cb_setid, pattern=r"^df_setid:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_fwd, pattern=r"^df_fwd:\d+$"))
@@ -2906,7 +2846,6 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_ad_marktrust, pattern=r"^ad_marktrust$"))
     app.add_handler(CallbackQueryHandler(cb_tr_del, pattern=r"^tr_del:\d+$"))
 
-    # Messages
     app.add_handler(MessageHandler(filters.FORWARDED, recv_fx_input), group=0)
     app.add_handler(MessageHandler(filters.FORWARDED, recv_forward), group=1)
     app.add_handler(MessageHandler(
@@ -2929,9 +2868,10 @@ def main():
     app.add_error_handler(error_handler)
 
     print("=" * 60)
-    print("DealFound Bot v14 — tg://user FIRST")
+    print("DealFound Bot v16 — GFX Module Separated")
     print(f"DB: {DB_PATH}")
     print(f"Session: {SESSION_PATH}.session")
+    print(f"GFX Module: {'OK' if GFX_MODULE_OK else 'FAILED'}")
     print(f"Telethon: {'ON' if TELETHON_OK else 'OFF'}")
     print(f"Pillow: {'ON' if PILLOW_OK else 'OFF'}")
     print("=" * 60)
